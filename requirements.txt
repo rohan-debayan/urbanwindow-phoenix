@@ -1,0 +1,5 @@
+# Packages beyond the I-GUIDE geoai kernel.
+# The notebook also installs these inline; listing them here per I-GUIDE guidance.
+libpysal
+esda
+contextily

@@ -1,0 +1,11 @@
+data/
+data_citywide/
+*.tar.gz
+*.zip
+*.pth
+*.gpkg
+*.parquet
+_fullcity*
+_uw_data*
+__pycache__/
+.ipynb_checkpoints/
