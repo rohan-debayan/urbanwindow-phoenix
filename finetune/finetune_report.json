@@ -1,0 +1,26 @@
+{
+  "before": {
+    "bg": 0.0,
+    "Building": 0.694,
+    "Sky": 0.881,
+    "Vegetation": 0.17,
+    "Road": 0.158,
+    "Waterbody": 0.528,
+    "Vehicle": 0.0,
+    "Terrain": 0.0
+  },
+  "after": {
+    "bg": 0.0,
+    "Building": 0.809,
+    "Sky": 0.971,
+    "Vegetation": 0.379,
+    "Road": 0.262,
+    "Waterbody": 0.497,
+    "Vehicle": 0.0,
+    "Terrain": 0.318
+  },
+  "n_train": 168,
+  "n_test": 42,
+  "epochs": 8,
+  "lr": 0.0001
+}
