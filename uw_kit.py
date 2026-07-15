@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 REAL = ['85004', '85281', '85016']
 NBHD = {'85004': 'Downtown (high-rise core)', '85281': 'Tempe / ASU (mid-rise)', '85016': 'Arcadia (suburban)'}
 COLORS = {'85004': '#d95f0e', '85281': '#31a354', '85016': '#2c7fb8'}
+SVI_THEMES = {'RPL_THEME1': 'socioeconomic status', 'RPL_THEME2': 'household characteristics', 'RPL_THEME3': 'racial & ethnic minority', 'RPL_THEME4': 'housing & transport'}
 
 
 def ensure_dataset(root, url):
@@ -153,10 +154,32 @@ def heat_divergence(g):
     typ = g[g.green_pct.between(0.33, 0.66)]
     return {'hidden_green': (hidden.lst.mean(), len(hidden)), 'typical': (typ.lst.mean(), len(typ)), 'exposed': (exposed.lst.mean(), len(exposed))}
 
-def equity_split(g):
-    p = g['svi'].rank(pct=True)
+def equity_split(g, col='svi'):
+    p = g[col].rank(pct=True)
     hi, lo = (g[p > 0.66], g[p < 0.33])
     return {'most_vulnerable': (hi.green.mean(), hi.lst.mean(), len(hi)), 'least_vulnerable': (lo.green.mean(), lo.lst.mean(), len(lo))}
+
+def attach_svi_themes(g, svi_path):
+    import geopandas as gpd
+    themes = list(SVI_THEMES)
+    pts = gpd.GeoDataFrame({'_i': range(len(g))}, geometry=gpd.points_from_xy(g['lon'], g['lat']), crs='EPSG:4326')
+    svi = gpd.read_file(svi_path).to_crs('EPSG:4326')
+    j = gpd.sjoin(pts, svi[['GEOID'] + themes + ['geometry']], how='left', predicate='within')
+    j = j[~j['_i'].duplicated(keep='first')].set_index('_i')
+    out = g.copy()
+    out['GEOID'] = j['GEOID'].to_numpy()
+    for t in themes:
+        out[t] = j[t].to_numpy()
+    return out
+
+def svi_theme_summary(g, targets=('green', 'lst')):
+    rows = []
+    for key in ['svi'] + list(SVI_THEMES):
+        name = 'composite (RPL_THEMES)' if key == 'svi' else f'{key} ({SVI_THEMES[key]})'
+        row = {'theme': name}
+        row.update({f'r~{t}': round(float(g[key].corr(g[t])), 3) for t in targets})
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 def double_burden(g):
     return g[(g.green_lisa == 'LL') & (g.lst_lisa == 'HH')]
@@ -212,6 +235,167 @@ def plot_equity_corner(g, ax=None):
     ax.set_title('Window-view green vs. surface temperature, colored by vulnerability')
     return ax
 
+def to_tract(g, cols=('green', 'lst', 'svi')):
+    preds = list(SVI_THEMES)
+    agg = list(dict.fromkeys(list(cols) + preds))
+    return g.dropna(subset=['GEOID']).groupby('GEOID')[agg].mean().reset_index()
+
+def svi_relimp(g, target='green'):
+    from itertools import combinations
+    from math import factorial
+    preds = list(SVI_THEMES)
+    d = g.dropna(subset=preds + [target])
+    y = d[target].to_numpy(float) - d[target].mean()
+    X = {p: d[p].to_numpy(float) - d[p].mean() for p in preds}
+    def r2(cols):
+        if not cols:
+            return 0.0
+        A = np.column_stack([X[c] for c in cols])
+        beta, *_ = np.linalg.lstsq(A, y, rcond=None)
+        return 1 - ((y - A @ beta) ** 2).sum() / (y ** 2).sum()
+    k = len(preds)
+    share = {p: 0.0 for p in preds}
+    for p in preds:
+        rest = [q for q in preds if q != p]
+        for r in range(len(rest) + 1):
+            for S in combinations(rest, r):
+                w = factorial(len(S)) * factorial(k - len(S) - 1) / factorial(k)
+                share[p] += w * (r2(list(S) + [p]) - r2(list(S)))
+    total = r2(preds)
+    out = pd.DataFrame({'theme': [f'{p} ({SVI_THEMES[p]})' for p in preds],
+                        'lmg_R2_share': [round(share[p], 4) for p in preds]})
+    out['pct_of_explained'] = (out['lmg_R2_share'] / total * 100).round(1)
+    out.attrs['R2_total'] = round(total, 4)
+    return out
+
+def svi_regression(g, level='tract', target='green'):
+    import statsmodels.api as sm
+    preds = list(SVI_THEMES)
+    d = g.dropna(subset=preds + [target, 'GEOID']).copy()
+    if level == 'tract':
+        d = d.groupby('GEOID')[preds + [target]].mean().reset_index()
+    z = lambda a: (a - a.mean()) / a.std()
+    X = sm.add_constant(np.column_stack([z(d[p].to_numpy(float)) for p in preds]))
+    y = z(d[target].to_numpy(float))
+    if level == 'tract':
+        m = sm.OLS(y, X).fit()
+    else:
+        m = sm.OLS(y, X).fit(cov_type='cluster', cov_kwds={'groups': d['GEOID'].to_numpy()})
+    return pd.DataFrame({'theme': preds,
+                         'std_beta': np.round(m.params[1:], 3),
+                         'p': np.round(m.pvalues[1:], 4),
+                         'R2': round(m.rsquared, 3),
+                         'n': int(m.nobs)})
+
+def plot_svi_theme_maps_pts(g, basemap=True):
+    gm = g.to_crs(3857)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 11))
+    for ax, k in zip(axes.ravel(), list(SVI_THEMES)):
+        gm.plot(column=k, cmap='plasma', markersize=2, ax=ax, legend=True, vmin=0, vmax=1)
+        if basemap:
+            try:
+                import contextily as cx
+                cx.add_basemap(ax, source=cx.providers.CartoDB.Positron, attribution=False)
+            except Exception:
+                pass
+        ax.set_title(f'{k}: {SVI_THEMES[k]}')
+        ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle('SVI sub-themes (per building)', fontsize=14)
+    fig.tight_layout()
+    return fig
+
+def plot_svi_green_maps_pts(g, basemap=True):
+    gm = g.to_crs(3857)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    for ax, (col, cmap, ttl) in zip(axes, [('svi', 'plasma', 'composite SVI'), ('green', 'Greens', 'window-view green')]):
+        gm.plot(column=col, cmap=cmap, markersize=2, ax=ax, legend=True)
+        if basemap:
+            try:
+                import contextily as cx
+                cx.add_basemap(ax, source=cx.providers.CartoDB.Positron, attribution=False)
+            except Exception:
+                pass
+        ax.set_title(ttl)
+        ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle('Composite SVI vs. window-green (per building)', fontsize=13)
+    fig.tight_layout()
+    return fig
+
+def plot_tract_svi_green(svi_path, g, basemap=True):
+    import geopandas as gpd
+    gt = to_tract(g)[['GEOID', 'green']]
+    svi = gpd.read_file(svi_path)
+    svi = svi[svi['GEOID'].isin(set(g['GEOID'].dropna()))].merge(gt, on='GEOID', how='left').to_crs(3857)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    for ax, (col, cmap, ttl) in zip(axes, [('RPL_THEMES', 'plasma', 'composite SVI'), ('green', 'Greens', 'window-view green (tract mean)')]):
+        svi.plot(column=col, cmap=cmap, ax=ax, legend=True, alpha=0.75, missing_kwds={'color': 'lightgrey'})
+        if basemap:
+            try:
+                import contextily as cx
+                cx.add_basemap(ax, source=cx.providers.CartoDB.Positron, attribution=False)
+            except Exception:
+                pass
+        ax.set_title(ttl)
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle('Composite vulnerability vs. window-green, by census tract', fontsize=13)
+    fig.tight_layout()
+    return fig
+
+def plot_svi_theme_maps(svi_path, geoids=None, basemap=True):
+    import geopandas as gpd
+    svi = gpd.read_file(svi_path)
+    if geoids is not None:
+        svi = svi[svi['GEOID'].isin(set(geoids))]
+    svi = svi.to_crs(3857)
+    keys = list(SVI_THEMES)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 11))
+    for ax, k in zip(axes.ravel(), keys):
+        svi.plot(column=k, cmap='plasma', ax=ax, legend=True, vmin=0, vmax=1, alpha=0.75,
+                 missing_kwds={'color': 'lightgrey'})
+        if basemap:
+            try:
+                import contextily as cx
+                cx.add_basemap(ax, source=cx.providers.CartoDB.Positron, attribution=False)
+            except Exception:
+                pass
+        ax.set_title(f'{k}: {SVI_THEMES[k]}')
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle('SVI sub-themes by census tract', fontsize=14)
+    fig.tight_layout()
+    return fig
+
+def _scatter_fit(ax, x, y, color):
+    m = ~(np.isnan(x) | np.isnan(y))
+    x, y = x[m], y[m]
+    sparse = len(x) < 1500  # tract level has few points; give them larger markers
+    ax.scatter(x, y, s=30 if sparse else 6, alpha=0.6 if sparse else 0.2, color=color, edgecolors='none')
+    slope, intr = np.polyfit(x, y, 1)
+    xs = np.array([x.min(), x.max()])
+    ax.plot(xs, slope * xs + intr, color='0.15', lw=2)
+    return np.corrcoef(x, y)[0, 1]
+
+def plot_svi_vs_green(g, col='svi', ax=None):
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 6))
+    r = _scatter_fit(ax, g[col].to_numpy(dtype=float), g['green'].to_numpy(dtype=float), '#2c7fb8')
+    name = 'composite SVI' if col == 'svi' else f'{col} ({SVI_THEMES.get(col, col)})'
+    ax.set_xlabel(name)
+    ax.set_ylabel('window-view green ratio')
+    ax.set_title(f'Window-view green vs. {name}  (r = {r:.2f})')
+    return ax
+
+def plot_svi_themes_vs_green(g):
+    keys = list(SVI_THEMES)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    for ax, k in zip(axes.ravel(), keys):
+        r = _scatter_fit(ax, g[k].to_numpy(dtype=float), g['green'].to_numpy(dtype=float), '#31a354')
+        ax.set_xlabel(f'{k} percentile')
+        ax.set_ylabel('window-view green ratio')
+        ax.set_title(f'{k}: {SVI_THEMES[k]}  (r = {r:.2f})')
+    fig.suptitle('Window-view green vs. SVI sub-themes', fontsize=14)
+    fig.tight_layout()
+    return fig
+
 def plot_maps(g, basemap=True):
     gm = g.to_crs(3857)
     cents = {}
@@ -234,3 +418,334 @@ def plot_maps(g, basemap=True):
         ax.set_yticks([])
     fig.tight_layout()
     return fig
+
+
+def plot_con_green_by_floor(
+    pv,
+    ax=None,
+    zctas=REAL,
+    min_count=15,
+    building_weighted=True
+):
+    if ax is None:
+        _, ax = plt.subplots(figsize=(10, 6))
+
+    # Geographic subset
+    if zctas is None:
+        d = pv.copy()
+    else:
+        d = pv[pv['zcta'].isin(zctas)].copy()
+
+    # Keep valid observations
+    d = d.dropna(
+        subset=['osm_id', 'floor', 'green', 'rise_class']
+    )
+
+    # Make sure floor and green are numeric
+    d['floor'] = pd.to_numeric(d['floor'], errors='coerce')
+    d['green'] = pd.to_numeric(d['green'], errors='coerce')
+
+    d = d.dropna(subset=['floor', 'green'])
+    d = d[d['floor'] >= 1]
+
+    # Recommended:
+    # each building contributes once at each floor
+    if building_weighted:
+        d = (
+            d.groupby(
+                ['osm_id', 'rise_class', 'floor'],
+                as_index=False,
+                observed=True
+            )
+            .agg(green=('green', 'mean'))
+        )
+
+    styles = [
+        ('low_rise', '#2c7fb8'),
+        ('mid_rise', '#31a354'),
+        ('high_rise', '#d95f0e')
+    ]
+
+    for rise_class, color in styles:
+        s = d[d['rise_class'] == rise_class]
+
+        summary = (
+            s.groupby('floor', observed=True)['green']
+            .agg(
+                mean='mean',
+                std='std',
+                count='count'
+            )
+            .reset_index()
+            .sort_values('floor')
+        )
+
+        # Do not plot floors supported by very small samples
+        summary = summary[summary['count'] >= min_count].copy()
+
+        if summary.empty:
+            continue
+
+        # A single observation produces NaN SD
+        summary['std'] = summary['std'].fillna(0)
+
+        lower = (summary['mean'] - summary['std']).clip(lower=0)
+        upper = (summary['mean'] + summary['std']).clip(upper=1)
+
+        ax.fill_between(
+            summary['floor'].to_numpy(),
+            lower.to_numpy(),
+            upper.to_numpy(),
+            color=color,
+            alpha=0.20,
+            linewidth=0,
+            label=f"{rise_class.replace('_', '-')} (±1 SD)"
+        )
+
+        ax.plot(
+            summary['floor'],
+            summary['mean'],
+            color=color,
+            linewidth=2.2,
+            label=rise_class.replace('_', '-')
+        )
+
+    ax.set_xlabel('Floor')
+    ax.set_ylabel('Mean window-view green ratio')
+    ax.set_title('Window-view green with floor height by building form')
+
+    ax.set_ylim(bottom=0)
+    ax.grid(alpha=0.2)
+    ax.legend()
+
+    return ax
+
+
+def plot_lst_by_floor(pv, g, ax=None, zctas=REAL):
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 5))
+
+    # Select the necessary building-level variables.
+    building_lst = (
+        g[['osm_id', 'lst']]
+        .dropna(subset=['osm_id', 'lst'])
+        .drop_duplicates(subset='osm_id')
+    )
+    # Add each building's LST to all viewpoints belonging to that building.
+    d = pv.merge(
+        building_lst,
+        on='osm_id',
+        how='left',
+        validate='many_to_one'
+    )
+    # Apply the same geographic filter used by plot_green_by_floor().
+    if zctas is not None:
+        d = d[d['zcta'].isin(zctas)]
+
+    d = d.dropna(subset=['floor', 'rise_class', 'lst']).copy()
+
+    bins = [0, 1, 3, 6, 10, 1000]
+    labs = ['1\n(street)', '2-3', '4-6', '7-10', '11+']
+
+    d['fb'] = pd.cut(
+        d['floor'],
+        bins=bins,
+        labels=labs
+    )
+    xp = {label: i for i, label in enumerate(labs)}
+
+    for rc, col in [
+        ('low_rise', '#2c7fb8'),
+        ('mid_rise', '#31a354'),
+        ('high_rise', '#d95f0e')
+    ]:
+        s = d[d['rise_class'] == rc]
+
+        gg = (
+            s.groupby('fb', observed=True)['lst']
+            .agg(['mean', 'count'])
+        )
+
+        # Keep the same minimum-sample rule as the original function.
+        gg = gg[gg['count'] >= 15]
+
+        ax.plot(
+            [xp[i] for i in gg.index],
+            gg['mean'],
+            marker='o',
+            lw=2.2,
+            color=col,
+            label=rc
+        )
+    ax.set_xticks(range(len(labs)))
+    ax.set_xticklabels(labs)
+    ax.set_xlabel('floor (binned)')
+    ax.set_ylabel('mean land-surface temperature (°C)')
+    ax.set_title(
+        'Mean land-surface temperature by floor and building form'
+    )
+    ax.legend()
+
+    return ax
+
+def plot_lst_vs_green_by_floor(pv, g, ax=None, zctas=REAL):
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 6))
+
+    # Add building-level LST to each viewpoint
+    building_lst = (
+        g[['osm_id', 'lst']]
+        .dropna(subset=['osm_id', 'lst'])
+        .drop_duplicates('osm_id')
+    )
+
+    d = pv.merge(
+        building_lst,
+        on='osm_id',
+        how='left',
+        validate='many_to_one'
+    )
+
+    # Keep selected study areas
+    if zctas is not None:
+        d = d[d['zcta'].isin(zctas)]
+
+    d = d.dropna(subset=['green', 'lst', 'floor']).copy()
+
+    # Create floor categories
+    bins = [0, 1, 3, 6, 10, 1000]
+    labs = ['1 (street)', '2-3', '4-6', '7-10', '11+']
+
+    d['floor_bin'] = pd.cut(
+        d['floor'],
+        bins=bins,
+        labels=labs
+    )
+
+    # Reduce repeated viewpoints:
+    # one observation per building and floor bin
+    d_plot = (
+        d.groupby(
+            ['osm_id', 'floor_bin'],
+            observed=True,
+            as_index=False
+        )
+        .agg(
+            green=('green', 'mean'),
+            lst=('lst', 'first')
+        )
+    )
+
+    for floor_bin in labs:
+        s = d_plot[d_plot['floor_bin'] == floor_bin]
+    
+        if len(s) < 5:
+            continue
+    
+        r = s['green'].corr(s['lst'])
+    
+        ax.scatter(
+            s['green'],
+            s['lst'],
+            s=22,
+            alpha=0.55,
+            label=f'{floor_bin}: r={r:.2f}, n={len(s)}'
+        )
+
+    ax.set_xlabel('mean window-view green ratio')
+    ax.set_ylabel('land-surface temperature (°C)')
+    ax.set_title('Surface temperature vs. window-view green by floor')
+    ax.legend(title='floor')
+
+    return ax
+
+
+def plot_lst_vs_green_by_building_form(pv, g, zctas=REAL):
+    building_data = (
+        g[['osm_id', 'lst']]
+        .dropna(subset=['osm_id', 'lst'])
+        .drop_duplicates('osm_id')
+    )
+
+    d = pv.merge(
+        building_data,
+        on='osm_id',
+        how='left',
+        validate='many_to_one'
+    )
+
+    if zctas is not None:
+        d = d[d['zcta'].isin(zctas)]
+
+    d = d.dropna(
+        subset=['green', 'lst', 'floor', 'rise_class']
+    ).copy()
+
+    bins = [0, 1, 3, 6, 10, 1000]
+    labs = ['1 (street)', '2-3', '4-6', '7-10', '11+']
+
+    d['floor_bin'] = pd.cut(
+        d['floor'],
+        bins=bins,
+        labels=labs
+    )
+
+    # Average the viewpoints for each building and floor group
+    d_plot = (
+        d.groupby(
+            ['osm_id', 'rise_class', 'floor_bin'],
+            observed=True,
+            as_index=False
+        )
+        .agg(
+            green=('green', 'mean'),
+            lst=('lst', 'first')
+        )
+    )
+
+    forms = ['low_rise', 'mid_rise', 'high_rise']
+
+    fig, axes = plt.subplots(
+        1, 3,
+        figsize=(15, 5),
+        sharex=True,
+        sharey=True
+    )
+
+    for ax, form in zip(axes, forms):
+        form_data = d_plot[d_plot['rise_class'] == form]
+
+        for floor_bin in labs:
+            s = form_data[
+                form_data['floor_bin'] == floor_bin
+            ]
+
+            if len(s) < 5:
+                continue
+
+            ax.scatter(
+                s['green'],
+                s['lst'],
+                s=20,
+                alpha=0.55,
+                label=floor_bin
+            )
+
+        r = form_data['green'].corr(form_data['lst'])
+
+        ax.set_title(
+            f"{form.replace('_', ' ').title()}\n"
+            f"overall r = {r:.2f}"
+        )
+        ax.set_xlabel('window-view green ratio')
+
+    axes[0].set_ylabel('land-surface temperature (°C)')
+    axes[-1].legend(title='floor')
+
+    fig.suptitle(
+        'Surface temperature vs. window-view green\n'
+        'by floor and building form'
+    )
+    fig.tight_layout()
+
+    return fig, axes
