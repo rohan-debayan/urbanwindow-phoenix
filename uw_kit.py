@@ -423,102 +423,115 @@ def plot_maps(g, basemap=True):
 def plot_con_green_by_floor(
     pv,
     ax=None,
-    zctas=REAL,
-    min_count=15,
-    building_weighted=True
+    zctas=None,
+    min_buildings=5,
+    building_weighted=True,
+    max_floor=None,
+    show_counts=False
 ):
     if ax is None:
-        _, ax = plt.subplots(figsize=(10, 6))
-
+        _, ax = plt.subplots(figsize=(11, 6))
     # Geographic subset
     if zctas is None:
         d = pv.copy()
     else:
         d = pv[pv['zcta'].isin(zctas)].copy()
-
-    # Keep valid observations
-    d = d.dropna(
-        subset=['osm_id', 'floor', 'green', 'rise_class']
-    )
-
-    # Make sure floor and green are numeric
+    required = ['osm_id', 'floor', 'green', 'rise_class']
+    d = d.dropna(subset=required).copy()
     d['floor'] = pd.to_numeric(d['floor'], errors='coerce')
     d['green'] = pd.to_numeric(d['green'], errors='coerce')
-
     d = d.dropna(subset=['floor', 'green'])
     d = d[d['floor'] >= 1]
-
-    # Recommended:
-    # each building contributes once at each floor
+    if max_floor is not None:
+        d = d[d['floor'] <= max_floor]
+    # Make floors integer-valued
+    d['floor'] = d['floor'].round().astype(int)
+    # Give each building equal weight at each floor
     if building_weighted:
         d = (
             d.groupby(
                 ['osm_id', 'rise_class', 'floor'],
-                as_index=False,
-                observed=True
+                observed=True,
+                as_index=False
             )
             .agg(green=('green', 'mean'))
         )
-
     styles = [
         ('low_rise', '#2c7fb8'),
         ('mid_rise', '#31a354'),
         ('high_rise', '#d95f0e')
     ]
-
+    plotted_max_floor = 1
     for rise_class, color in styles:
-        s = d[d['rise_class'] == rise_class]
-
+        s = d[d['rise_class'] == rise_class].copy()
         summary = (
-            s.groupby('floor', observed=True)['green']
+            s.groupby('floor', observed=True)
             .agg(
-                mean='mean',
-                std='std',
-                count='count'
+                mean=('green', 'mean'),
+                std=('green', 'std'),
+                n_buildings=('osm_id', 'nunique')
             )
             .reset_index()
             .sort_values('floor')
         )
-
-        # Do not plot floors supported by very small samples
-        summary = summary[summary['count'] >= min_count].copy()
-
+        # Keep floors supported by enough unique buildings
+        summary = summary[
+            summary['n_buildings'] >= min_buildings
+        ].copy()
         if summary.empty:
             continue
-
-        # A single observation produces NaN SD
         summary['std'] = summary['std'].fillna(0)
-
         lower = (summary['mean'] - summary['std']).clip(lower=0)
         upper = (summary['mean'] + summary['std']).clip(upper=1)
-
+        plotted_max_floor = max(
+            plotted_max_floor,
+            int(summary['floor'].max())
+        )
         ax.fill_between(
             summary['floor'].to_numpy(),
             lower.to_numpy(),
             upper.to_numpy(),
             color=color,
-            alpha=0.20,
+            alpha=0.18,
             linewidth=0,
             label=f"{rise_class.replace('_', '-')} (±1 SD)"
         )
-
         ax.plot(
             summary['floor'],
             summary['mean'],
             color=color,
+            marker='o',
+            markersize=5,
             linewidth=2.2,
             label=rise_class.replace('_', '-')
         )
-
+        if show_counts:
+            for _, row in summary.iterrows():
+                ax.annotate(
+                    f"n={int(row['n_buildings'])}",
+                    (row['floor'], row['mean']),
+                    xytext=(0, 7),
+                    textcoords='offset points',
+                    ha='center',
+                    fontsize=8
+                )
     ax.set_xlabel('Floor')
-    ax.set_ylabel('Mean window-view green ratio')
-    ax.set_title('Window-view green with floor height by building form')
-
+    ax.set_ylabel('Mean simulated window-view green ratio')
+    ax.set_title(
+        'Simulated window-view green by floor and building form'
+    )
+    ax.set_xticks(
+        range(1, plotted_max_floor + 1)
+    )
+    ax.set_xlim(
+        0.7,
+        plotted_max_floor + 0.3
+    )
     ax.set_ylim(bottom=0)
     ax.grid(alpha=0.2)
     ax.legend()
-
     return ax
+
 
 
 def plot_lst_by_floor(pv, g, ax=None, zctas=REAL):
@@ -748,4 +761,131 @@ def plot_lst_vs_green_by_building_form(pv, g, zctas=REAL):
     )
     fig.tight_layout()
 
+    return fig, axes
+
+
+def prepare_citywide_heat_data(g_city):
+    required = {"green", "ndvi", "svi", "lst"}
+    missing = required.difference(g_city.columns)
+
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    uhi = g_city.dropna(
+        subset=["green", "ndvi", "svi", "lst"]
+    ).copy()
+
+    uhi["green_pct"] = uhi["green"].rank(pct=True)
+    uhi["ndvi_pct"] = uhi["ndvi"].rank(pct=True)
+
+    return uhi
+
+def heat_divergence_city(uhi):
+    hidden = uhi[
+        (uhi["ndvi_pct"] < 0.33) &
+        (uhi["green_pct"] > 0.66)
+    ]
+
+    exposed = uhi[
+        (uhi["ndvi_pct"] > 0.66) &
+        (uhi["green_pct"] < 0.33)
+    ]
+
+    typical = uhi[
+        uhi["green_pct"].between(0.33, 0.66)
+    ]
+
+    return {
+        "hidden_green": (hidden["lst"].mean(), len(hidden)),
+        "typical": (typical["lst"].mean(), len(typical)),
+        "exposed": (exposed["lst"].mean(), len(exposed))
+    }
+
+
+def per_building_green_ndvi_city(g_city):
+    return (
+        g_city.dropna(subset=["osm_id", "green", "ndvi"])
+              .groupby("osm_id", as_index=False)
+              .agg(
+                  green=("green", "mean"),
+                  ndvi=("ndvi", "mean")
+              )
+    )
+
+def plot_green_vs_ndvi_city(pb, ax=None):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 5))
+
+    r = pb["green"].corr(pb["ndvi"])
+
+    ax.scatter(
+        pb["ndvi"],
+        pb["green"],
+        s=10,
+        alpha=0.4
+    )
+
+    ax.set_xlabel("Top-down NDVI")
+    ax.set_ylabel("Building green fraction")
+    ax.set_title(f"City-wide green fraction vs NDVI (r = {r:.2f})")
+
+    return ax
+
+
+def plot_heat_panels(g_city):
+    import numpy as np
+    from matplotlib.lines import Line2D
+    from scipy.stats import sem, t
+    group_order = ['Hidden Green', 'Typical', 'Exposed']
+    group_colors = {'Hidden Green': 'lime', 'Typical': 'Olive', 'Exposed': '#B2182B', 'Other': '#D9D9D9'}
+    g = g_city.dropna(subset=['green', 'ndvi', 'lst', 'geometry']).copy()
+    g['green_pct'] = g['green'].rank(pct=True)
+    g['ndvi_pct'] = g['ndvi'].rank(pct=True)
+    cond = [(g['ndvi_pct'] < 0.33) & (g['green_pct'] > 0.66),
+            (g['ndvi_pct'] > 0.66) & (g['green_pct'] < 0.33),
+            g['green_pct'].between(0.33, 0.66)]
+    g['heat_group'] = np.select(cond, ['Hidden Green', 'Exposed', 'Typical'], default='Other')
+    rows = []
+    for grp in group_order:
+        v = g.loc[g['heat_group'] == grp, 'lst'].dropna()
+        n = len(v)
+        ci = float(t.ppf(0.975, df=n - 1) * sem(v)) if n > 1 else float('nan')
+        rows.append({'Group': grp, 'Mean_LST': v.mean(), 'Median_LST': v.median(),
+                     'SD': v.std(ddof=1), 'CI95': ci, 'n': n})
+    print(pd.DataFrame(rows).round(2).to_string(index=False))
+    data = [g.loc[g['heat_group'] == grp, 'lst'].dropna().values for grp in group_order]
+    labels_n = ['%s\n(n=%d)' % (grp, len(d)) for grp, d in zip(group_order, data)]
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    axm, axv, axs = axes
+    for grp in group_order:
+        gd = g[g['heat_group'] == grp]
+        if len(gd):
+            gd.plot(ax=axm, color=group_colors[grp], edgecolor='none', alpha=0.5)
+    handles = [Line2D([0], [0], marker='o', linestyle='', markerfacecolor=group_colors[grp],
+                      markeredgecolor='none', markersize=7, label=grp) for grp in group_order]
+    axm.legend(handles=handles, title='Vegetation-view category', loc='upper left',
+               frameon=True, fontsize=9, title_fontsize=9)
+    axm.set_title('A. Spatial distribution')
+    axm.set_axis_off()
+    pos = np.arange(1, len(group_order) + 1)
+    vp = axv.violinplot(data, positions=pos, widths=0.8, showextrema=False)
+    for body, grp in zip(vp['bodies'], group_order):
+        body.set_facecolor(group_colors[grp])
+        body.set_edgecolor('black')
+        body.set_alpha(0.6)
+    axv.boxplot(data, positions=pos, widths=0.2, patch_artist=True, showmeans=True)
+    axv.set_xticks(pos)
+    axv.set_xticklabels(labels_n)
+    axv.set_ylabel('Land surface temperature (°C)')
+    axv.set_title('B. LST distribution')
+    axv.grid(axis='y', alpha=0.2)
+    sc = axs.scatter(g['ndvi_pct'], g['green_pct'], c=g['lst'], cmap='coolwarm', s=8, alpha=0.6)
+    for xv in (0.33, 0.66):
+        axs.axvline(xv, color='black', linestyle='--')
+    axs.axhline(0.33, color='black', linestyle='--')
+    axs.set_xlabel('NDVI percentile')
+    axs.set_ylabel('Visible green percentile')
+    axs.set_title('C. Green versus NDVI')
+    fig.colorbar(sc, ax=axs, label='Land surface temperature (°C)')
+    fig.tight_layout()
     return fig, axes
