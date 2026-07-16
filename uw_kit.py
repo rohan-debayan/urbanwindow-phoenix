@@ -144,6 +144,130 @@ def compare_cities(g_phx, hou):
         return {'green~LST': round(float(d.green.corr(d.lst)), 2), 'SVI~LST': round(float(d.svi.corr(d.lst)), 2), 'n': int(len(d))}
     return {'Phoenix': s(g_phx), 'Houston': s(hou)}
 
+# Full-name labels for the drivers window-view green is compared against.
+DRIVER_LABELS = {'ndvi': 'NDVI', 'lst': 'urban heat', 'svi': 'social vulnerability'}
+
+def green_correlations(cities, drivers=('ndvi', 'lst', 'svi')):
+    """Building-level correlation of window-view green with each driver, per city.
+    `cities` is a dict {name: df}. Drivers missing from a city's table (e.g.
+    Houston NDVI, pending) come back as NaN rather than raising."""
+    out = {}
+    for name, d in cities.items():
+        out[name] = {
+            f'green ~ {DRIVER_LABELS.get(x, x)}': (round(float(d['green'].corr(d[x])), 2) if x in d.columns else float('nan'))
+            for x in drivers
+        }
+    return pd.DataFrame(out)
+
+RISE_ORDER = ['low_rise', 'mid_rise', 'high_rise']
+RISE_LABELS = {'low_rise': 'low-rise', 'mid_rise': 'mid-rise', 'high_rise': 'high-rise'}
+
+def _norm_rise(d):
+    return d['rise_class'].astype(str).str.replace('-', '_')
+
+def green_correlations_by_rise(cities, drivers=('ndvi', 'lst', 'svi')):
+    """green~driver correlation split by rise class, per city. Returns a MultiIndex
+    DataFrame: index = rise class (low/mid/high), columns = (city, driver-label) with
+    a trailing (city, 'n') giving the buildings in that class. Missing drivers or
+    classes with <2 buildings come back NaN."""
+    frames = {}
+    for name, d in cities.items():
+        rc = _norm_rise(d)
+        rows = {}
+        for key in RISE_ORDER:
+            sub = d[rc == key]
+            row = {DRIVER_LABELS.get(x, x): (round(float(sub['green'].corr(sub[x])), 2)
+                                             if (x in sub.columns and len(sub) > 1) else float('nan'))
+                   for x in drivers}
+            row['n'] = len(sub)
+            rows[RISE_LABELS[key]] = row
+        frames[name] = pd.DataFrame(rows).T
+    return pd.concat(frames, axis=1)
+
+def plot_green_correlations_by_rise(cities, drivers=('ndvi', 'lst', 'svi')):
+    """One panel per driver; x = rise class, grouped bars = cities. NaN (missing
+    driver or too few buildings) draws no bar and is annotated 'n/a'."""
+    tbl = green_correlations_by_rise(cities, drivers)
+    names = list(cities.keys())
+    rise_lab = list(tbl.index)
+    x = np.arange(len(rise_lab))
+    w = 0.8 / len(names)
+    fig, axes = plt.subplots(1, len(drivers), figsize=(5 * len(drivers), 4.5), sharey=True)
+    if len(drivers) == 1:
+        axes = [axes]
+    for j, drv in enumerate(drivers):
+        ax, label = axes[j], DRIVER_LABELS.get(drv, drv)
+        for i, name in enumerate(names):
+            vals = tbl[(name, label)].to_numpy(dtype=float)
+            pos = x + (i - (len(names) - 1) / 2) * w
+            ax.bar(pos, np.nan_to_num(vals), width=w, label=name)
+            for px, v in zip(pos, vals):
+                if np.isnan(v):
+                    ax.text(px, 0.005, 'n/a', rotation=90, ha='center', va='bottom', fontsize=7, color='gray')
+                else:
+                    ax.text(px, v + (0.01 if v >= 0 else -0.01), f'{v:+.2f}',
+                            ha='center', va='bottom' if v >= 0 else 'top', fontsize=7)
+        ax.axhline(0, color='black', lw=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(rise_lab)
+        ax.set_title(f'green ~ {label}')
+        if j == 0:
+            ax.set_ylabel('Pearson r  (with window-view green)')
+    axes[-1].legend()
+    fig.suptitle('Green correlations by rise class: Phoenix vs Houston', y=1.02)
+    fig.tight_layout()
+    return fig
+
+def plot_green_correlations(cities, drivers=('ndvi', 'lst', 'svi'), ax=None):
+    """Grouped bar chart of window-view green's correlation with each driver,
+    Phoenix vs Houston. Missing drivers (NaN, e.g. Houston NDVI) draw no bar and
+    are annotated 'pending'."""
+    df = green_correlations(cities, drivers)          # rows = 'green ~ <label>', cols = cities
+    names = list(df.columns)
+    labels = [DRIVER_LABELS.get(x, x) for x in drivers]
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 5))
+    x = np.arange(len(drivers))
+    w = 0.8 / len(names)
+    for i, name in enumerate(names):
+        vals = df[name].to_numpy(dtype=float)
+        pos = x + (i - (len(names) - 1) / 2) * w
+        ax.bar(pos, np.nan_to_num(vals), width=w, label=name)
+        for px, v in zip(pos, vals):
+            if np.isnan(v):
+                ax.text(px, 0.005, 'pending', rotation=90, ha='center', va='bottom', fontsize=8, color='gray')
+            else:
+                ax.text(px, v + (0.01 if v >= 0 else -0.01), f'{v:+.2f}',
+                        ha='center', va='bottom' if v >= 0 else 'top', fontsize=8)
+    ax.axhline(0, color='black', lw=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel('Pearson r  (with window-view green)')
+    ax.set_title('What window-view green tracks with: Phoenix vs Houston')
+    ax.legend()
+    return ax
+
+def city_summary(phx, hou):
+    """Building-level summary comparing Phoenix and Houston on shared metrics.
+    Means for the continuous window-view/heat/vulnerability fields, counts for
+    rise_class (labels normalized to underscores), and total buildings last."""
+    def col(d):
+        n = len(d)
+        rc = d['rise_class'].astype(str).str.replace('-', '_').value_counts()
+        def cp(key):
+            c = int(rc.get(key, 0))
+            return f'{c:,} ({c / n:.1%})'
+        return {
+            'Window green (mean)': f'{d.green.mean():.3f}',
+            'LST (mean)': f'{d.lst.mean():.2f}',
+            'SVI (mean)': f'{d.svi.mean():.3f}',
+            'Low-rise (count, %)': cp('low_rise'),
+            'Mid-rise (count, %)': cp('mid_rise'),
+            'High-rise (count, %)': cp('high_rise'),
+            'Total buildings': f'{n:,}',
+        }
+    return pd.DataFrame({'Phoenix': col(phx), 'Houston': col(hou)})
+
 def per_building_green_ndvi(pv):
     d = pv[pv.zcta.isin(REAL)]
     return d.groupby(['osm_id', 'zcta']).agg(green=('green', 'mean'), ndvi=('ndvi', 'mean')).reset_index()
@@ -304,7 +428,14 @@ def plot_svi_theme_maps_pts(g, basemap=True):
     fig.tight_layout()
     return fig
 
-def plot_svi_green_maps_pts(g, basemap=True):
+def to_gdf(df, lon='lon', lat='lat', crs='EPSG:4326'):
+    """Build a point GeoDataFrame from a lon/lat table (e.g. the Houston CSV)."""
+    import geopandas as gpd
+    return gpd.GeoDataFrame(df.copy(), geometry=gpd.points_from_xy(df[lon], df[lat]), crs=crs)
+
+def plot_svi_green_maps_pts(g, basemap=True, title='Composite SVI vs. window-green (per building)'):
+    if getattr(g, 'geometry', None) is None:   # plain lon/lat table (e.g. Houston CSV)
+        g = to_gdf(g)
     gm = g.to_crs(3857)
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
     for ax, (col, cmap, ttl) in zip(axes, [('svi', 'plasma', 'composite SVI'), ('green', 'Greens', 'window-view green')]):
@@ -317,7 +448,34 @@ def plot_svi_green_maps_pts(g, basemap=True):
                 pass
         ax.set_title(ttl)
         ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle('Composite SVI vs. window-green (per building)', fontsize=13)
+    fig.suptitle(title, fontsize=13)
+    fig.tight_layout()
+    return fig
+
+def plot_svi_green_maps_by_rise(g, basemap=True, title='SVI vs. window-green by rise class (per building)'):
+    """The SVI-vs-green equity map, one row per rise class (low/mid/high) x two
+    columns (composite SVI, window-green). Green shares one colour scale across
+    rows so classes are comparable; building counts are shown per panel."""
+    if getattr(g, 'geometry', None) is None:   # plain lon/lat table (e.g. Houston CSV)
+        g = to_gdf(g)
+    gm = g.to_crs(3857)
+    rc = _norm_rise(gm)
+    gvmax = float(gm['green'].quantile(0.98))
+    fig, axes = plt.subplots(3, 2, figsize=(13, 18))
+    for row, key in enumerate(RISE_ORDER):
+        sub = gm[rc == key]
+        specs = [('svi', 'plasma', 'composite SVI', 0, 1), ('green', 'Greens', 'window-view green', 0, gvmax)]
+        for ax, (col, cmap, ttl, vmn, vmx) in zip(axes[row], specs):
+            sub.plot(column=col, cmap=cmap, markersize=3, ax=ax, legend=True, vmin=vmn, vmax=vmx)
+            if basemap:
+                try:
+                    import contextily as cx
+                    cx.add_basemap(ax, source=cx.providers.CartoDB.Positron, attribution=False)
+                except Exception:
+                    pass
+            ax.set_title(f'{RISE_LABELS[key]} (n={len(sub):,}) — {ttl}')
+            ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle(title, fontsize=14)
     fig.tight_layout()
     return fig
 
