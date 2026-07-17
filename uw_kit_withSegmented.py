@@ -296,12 +296,19 @@ def attach_svi_themes(g, svi_path):
         out[t] = j[t].to_numpy()
     return out
 
-def svi_theme_summary(g, targets=('green', 'lst')):
+def svi_theme_summary(g, targets=('green', 'lst'), alpha=0.05):
+    """Correlation of composite SVI and each sub-theme with the targets, each with a
+    two-sided p-value (Pearson; n = non-null pairs). The `r~<target>` column stays
+    numeric; the `p~<target>` column carries a trailing '*' when significant at
+    `alpha`, so significance is judged inline rather than in a separate step."""
     rows = []
     for key in ['svi'] + list(SVI_THEMES):
         name = 'composite (RPL_THEMES)' if key == 'svi' else f'{key} ({SVI_THEMES[key]})'
         row = {'theme': name}
-        row.update({f'r~{t}': round(float(g[key].corr(g[t])), 3) for t in targets})
+        for t in targets:
+            r, p, _ = corr_p(g[key], g[t])
+            row[f'r~{t}'] = round(r, 3)
+            row[f'p~{t}'] = f'{p:.1e}' + (' *' if (p == p and p < alpha) else '')
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -1731,3 +1738,140 @@ def plot_heat_panels(g_city):
     fig.colorbar(sc, ax=axs, label='Land surface temperature (°C)')
     fig.tight_layout()
     return fig, axes
+
+
+# --- Q4 extension: significance and the green-vulnerability link by floor ---
+
+FLOOR_BINS = [0, 1, 3, 6, 10, 1000]
+FLOOR_LABELS = ['1 (street)', '2-3', '4-6', '7-10', '11+']
+
+
+def corr_p(x, y):
+    """Pearson r with a two-sided p-value and the usable sample size.
+    Returns (r, p, n) after dropping pairs where either value is NaN;
+    (nan, nan, n) if fewer than 3 pairs remain."""
+    from scipy import stats
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = ~(np.isnan(x) | np.isnan(y))
+    x, y = x[m], y[m]
+    n = int(len(x))
+    if n < 3:
+        return float('nan'), float('nan'), n
+    r, p = stats.pearsonr(x, y)
+    return float(r), float(p), n
+
+
+def svi_green_by_floor(pv, g, target='svi', alpha=0.05):
+    """Does the window-green vs. social-vulnerability link hold at every floor?
+
+    SVI is a building-level (tract-constant) attribute, so it is attached to each
+    viewpoint by `osm_id`. Within each floor bin, window-green is first averaged to
+    one value per building (so n counts buildings, not windows, avoiding pseudo-
+    replication from many windows sharing a building's SVI), then correlated with
+    `target` across buildings. Returns a table with r, p, n and a significance flag
+    per floor bin."""
+    gm = g[['osm_id', target]].copy()
+    gm['osm_id'] = gm['osm_id'].astype(str)
+    gm = gm.drop_duplicates('osm_id')
+    d = pv.copy()
+    d['osm_id'] = d['osm_id'].astype(str)
+    d = d.merge(gm, on='osm_id', how='left')
+    d['floor_bin'] = pd.cut(d['floor'], bins=FLOOR_BINS, labels=FLOOR_LABELS)
+    per_bld = (d.dropna(subset=['green', target, 'floor_bin'])
+                .groupby(['floor_bin', 'osm_id'], observed=True)
+                .agg(green=('green', 'mean'), target=(target, 'first'))
+                .reset_index())
+    rows = []
+    for lab in FLOOR_LABELS:
+        sub = per_bld[per_bld['floor_bin'] == lab]
+        r, p, n = corr_p(sub['green'], sub['target'])
+        rows.append({'floor': lab, 'buildings': n, 'r': round(r, 3),
+                     'p': p, 'significant': bool(p < alpha) if p == p else False})
+    out = pd.DataFrame(rows)
+    out.attrs['target'] = target
+    return out
+
+
+def plot_svi_green_by_floor(pv, g, target='svi', alpha=0.05, ax=None):
+    """Bar chart of the window-green vs. SVI correlation by floor bin. Significant
+    bars (p < alpha) are solid; non-significant ones are greyed and annotated 'ns'.
+    Each bar is labelled with r and its building count."""
+    tbl = svi_green_by_floor(pv, g, target=target, alpha=alpha)
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 5))
+    x = np.arange(len(tbl))
+    for i, row in tbl.iterrows():
+        r = row['r']
+        sig = row['significant']
+        ax.bar(i, 0 if r != r else r, width=0.6,
+               color='#2c7fb8' if sig else '#c6dbef',
+               edgecolor='#2c7fb8', linewidth=1.0)
+        if r == r:
+            va = 'bottom' if r >= 0 else 'top'
+            off = 0.004 if r >= 0 else -0.004
+            ax.text(i, r + off, f'r={r:+.2f}\n{"" if sig else "ns, "}n={row["buildings"]:,}',
+                    ha='center', va=va, fontsize=8, color='0.2')
+    ax.axhline(0, color='black', lw=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(tbl['floor'])
+    ax.set_xlabel('floor (binned)')
+    label = 'composite SVI' if target == 'svi' else target
+    ax.set_ylabel(f'Pearson r  (window-green ~ {label})')
+    ax.set_title(f'Does the window-green ~ {label} link hold by floor?\n'
+                 f'(per-building means; solid = significant at p < {alpha})')
+    return ax
+
+
+# --- Comparison: building-level driver-vs-green maps and cross-city NDVI ---
+
+def plot_metric_green_maps_pts(g, metric='lst', cmap='inferno',
+                               metric_label=None, title=None, basemap=True):
+    """Two-panel building-level point map: a driver metric (e.g. surface heat `lst`
+    or top-down `ndvi`) beside window-view green, for one city. Mirrors
+    `plot_svi_green_maps_pts` so the SVI/heat/NDVI maps share a layout. Accepts a
+    plain lon/lat table (e.g. the Houston CSV) or a GeoDataFrame."""
+    if getattr(g, 'geometry', None) is None:
+        g = to_gdf(g)
+    gm = g.to_crs(3857)
+    metric_label = metric_label or metric
+    title = title or f'{metric_label} vs. window-green (per building)'
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    specs = [(metric, cmap, metric_label), ('green', 'Greens', 'window-view green')]
+    for ax, (col, cm, ttl) in zip(axes, specs):
+        gm.plot(column=col, cmap=cm, markersize=2, ax=ax, legend=True)
+        if basemap:
+            try:
+                import contextily as cx
+                cx.add_basemap(ax, source=cx.providers.CartoDB.Positron, attribution=False)
+            except Exception:
+                pass
+        ax.set_title(ttl)
+        ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle(title, fontsize=13)
+    fig.tight_layout()
+    return fig
+
+
+def plot_green_vs_ndvi_cities(cities):
+    """Side-by-side window-green vs. top-down NDVI scatter, one panel per city, each
+    annotated with Pearson r and n. `cities` is a dict {name: df}; a city lacking an
+    `ndvi` column is skipped with a note in its panel title."""
+    names = list(cities)
+    fig, axes = plt.subplots(1, len(names), figsize=(7 * len(names), 6), sharey=True)
+    if len(names) == 1:
+        axes = [axes]
+    for ax, name in zip(axes, names):
+        d = cities[name]
+        if 'ndvi' not in d.columns:
+            ax.set_title(f'{name}: NDVI unavailable')
+            ax.set_xticks([]); ax.set_yticks([])
+            continue
+        r = _scatter_fit(ax, d['ndvi'].to_numpy(dtype=float),
+                         d['green'].to_numpy(dtype=float), '#31a354')
+        ax.set_xlabel('top-down NDVI')
+        ax.set_title(f'{name}  (r = {r:+.2f}, n = {len(d):,})')
+    axes[0].set_ylabel('window-view green ratio')
+    fig.suptitle('Window-view green vs. top-down NDVI: Phoenix vs Houston', fontsize=13)
+    fig.tight_layout()
+    return fig
